@@ -11,7 +11,14 @@ from prompts import (
     build_chat_user_message,
     build_polish_messages,
 )
-from utils import ensure_list_length, merge_paragraphs, plain_text, split_paragraphs
+from utils import (
+    apply_polish_snapshot,
+    create_polish_snapshot,
+    ensure_list_length,
+    merge_paragraphs,
+    plain_text,
+    split_paragraphs,
+)
 
 # ---------------------------------------------------------------------------
 # 页面配置与全局样式
@@ -136,6 +143,28 @@ CUSTOM_CSS = """
         padding: 32px 16px;
         line-height: 1.6;
     }
+
+    /* 润色轮次与历史 */
+    .polish-round-badge {
+        display: inline-block;
+        background: #eff6ff;
+        color: #1d4ed8;
+        font-size: 0.82rem;
+        font-weight: 600;
+        padding: 4px 10px;
+        border-radius: 999px;
+        margin-right: 8px;
+    }
+    .history-trail {
+        font-size: 0.8rem;
+        color: #6b7280;
+        margin: 6px 0 10px 0;
+        line-height: 1.5;
+    }
+    .history-trail .current {
+        color: #1d4ed8;
+        font-weight: 600;
+    }
 </style>
 """
 
@@ -157,6 +186,8 @@ def init_session_state():
         "chat_history": [],
         "polish_active": False,
         "export_text": "",
+        "polish_history": [],
+        "polish_round": 0,
         "_logger_initialized": False,
     }
     for key, value in defaults.items():
@@ -167,9 +198,62 @@ def init_session_state():
         st.session_state._logger_initialized = True
 
 
-def run_polish(chat_user_msg: str | None = None):
+def _snapshot_label(trigger: str, chat_user_msg: str | None = None) -> str:
+    round_num = len(st.session_state.polish_history) + 1
+    if chat_user_msg:
+        preview = chat_user_msg[:24] + ("..." if len(chat_user_msg) > 24 else "")
+        return f"第 {round_num} 轮（{preview}）"
+    if trigger == "开始润色":
+        return f"第 {round_num} 轮（首次润色）"
+    return f"第 {round_num} 轮（{trigger}）"
+
+
+def save_polish_snapshot(trigger: str, chat_user_msg: str | None = None):
+    """将当前润色状态保存到历史栈。"""
+    round_num = len(st.session_state.polish_history) + 1
+    label = _snapshot_label(trigger, chat_user_msg)
+    snapshot = create_polish_snapshot(
+        label=label,
+        round_num=round_num,
+        current_paragraphs=st.session_state.current_paragraphs,
+        polished_paragraphs=st.session_state.polished_paragraphs,
+        reasons=st.session_state.reasons,
+        accepted=st.session_state.accepted,
+        rejected=st.session_state.rejected,
+        chat_history=st.session_state.chat_history,
+    )
+    st.session_state.polish_history.append(snapshot)
+    st.session_state.polish_round = round_num
+    log_step("润色历史", f"已保存快照: {label}")
+
+
+def rollback_polish(target_index: int | None = None):
+    """回滚到指定历史版本；默认回滚到上一轮。"""
+    history = st.session_state.polish_history
+    if len(history) <= 1:
+        log_step("润色回滚", "无法回滚：历史记录不足", level="warning")
+        st.warning("当前已是首轮润色，无法回滚。")
+        return
+
+    if target_index is None:
+        target_index = len(history) - 2
+    else:
+        target_index = max(0, min(target_index, len(history) - 2))
+
+    snapshot = history[target_index]
+    restored = apply_polish_snapshot(snapshot)
+    for key, value in restored.items():
+        st.session_state[key] = value
+
+    st.session_state.polish_history = history[: target_index + 1]
+    st.session_state.export_text = ""
+    log_step("润色回滚", f"已回滚到: {snapshot['label']}")
+
+
+def run_polish(chat_user_msg: str | None = None, *, trigger: str | None = None):
     """触发润色 API 调用，更新 session state。"""
-    trigger = "对话触发" if chat_user_msg else "开始润色"
+    if trigger is None:
+        trigger = "对话触发" if chat_user_msg else "再次润色"
     log_step(trigger, "开始执行润色流程...")
 
     paragraphs = st.session_state.current_paragraphs
@@ -212,6 +296,7 @@ def run_polish(chat_user_msg: str | None = None):
             build_chat_assistant_message(result.get("summary", ""), count)
         )
         st.session_state.polish_active = True
+        save_polish_snapshot(trigger, chat_user_msg)
 
         log_step(
             trigger,
@@ -248,8 +333,11 @@ def start_polish():
     st.session_state.reasons = [""] * len(paragraphs)
     st.session_state.accepted = [False] * len(paragraphs)
     st.session_state.rejected = [False] * len(paragraphs)
+    st.session_state.polish_history = []
+    st.session_state.polish_round = 0
+    st.session_state.export_text = ""
     log_step("开始润色", "段落状态已初始化，准备调用 API")
-    run_polish()
+    run_polish(trigger="开始润色")
 
 
 def accept_paragraph(index: int):
@@ -300,6 +388,64 @@ def _text_box(text: str, box_class: str) -> None:
         f'<div class="text-box {box_class}">{_esc(text)}</div>',
         unsafe_allow_html=True,
     )
+
+
+def render_polish_history_bar():
+    """渲染润色轮次、历史轨迹与回滚控件。"""
+    history = st.session_state.polish_history
+    if not history:
+        return
+
+    round_num = st.session_state.polish_round
+    st.markdown(
+        f'<span class="polish-round-badge">第 {round_num} 轮润色</span>',
+        unsafe_allow_html=True,
+    )
+
+    trail_parts = []
+    for i, snap in enumerate(history):
+        name = f"第 {snap['round']} 轮"
+        if i == len(history) - 1:
+            trail_parts.append(f'<span class="current">{name}（当前）</span>')
+        else:
+            trail_parts.append(name)
+    st.markdown(
+        f'<div class="history-trail">历史：{" → ".join(trail_parts)}</div>',
+        unsafe_allow_html=True,
+    )
+
+    btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 2])
+    with btn_col1:
+        if st.button("🔄 再次润色", key="repolish_btn", use_container_width=True):
+            run_polish(trigger="再次润色")
+            st.rerun()
+    with btn_col2:
+        can_rollback = len(history) > 1
+        if st.button(
+            "↩️ 回滚上一轮",
+            key="rollback_btn",
+            use_container_width=True,
+            disabled=not can_rollback,
+        ):
+            rollback_polish()
+            st.rerun()
+    with btn_col3:
+        if len(history) > 1:
+            options = [
+                f"{snap['label']}{'（当前）' if i == len(history) - 1 else ''}"
+                for i, snap in enumerate(history[:-1])
+            ]
+            selected = st.selectbox(
+                "回滚到指定版本",
+                options=options,
+                index=len(options) - 1 if options else 0,
+                key="rollback_select",
+                label_visibility="collapsed",
+            )
+            if st.button("确认回滚", key="rollback_confirm_btn", use_container_width=True):
+                target_index = options.index(selected)
+                rollback_polish(target_index)
+                st.rerun()
 
 
 def render_paragraph_card(index: int):
@@ -393,6 +539,7 @@ with left_col:
 
         if st.session_state.polish_active and st.session_state.original_paragraphs:
             st.markdown('<div class="section-header">📄 段落润色结果</div>', unsafe_allow_html=True)
+            render_polish_history_bar()
             for i in range(len(st.session_state.original_paragraphs)):
                 render_paragraph_card(i)
 
@@ -466,5 +613,5 @@ with right_col:
             log_step("对话触发", "失败：尚未开始润色", level="warning")
             st.warning("请先在左侧输入文章并点击「开始润色」。")
         else:
-            run_polish(chat_user_msg=msg)
+            run_polish(chat_user_msg=msg, trigger="对话触发")
             st.rerun()

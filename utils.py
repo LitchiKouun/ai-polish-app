@@ -60,3 +60,40 @@ def strip_html(text: str) -> str:
 def plain_text(text: str) -> str:
     """展示/API 入库前的纯文本清洗。"""
     return strip_html(text or "")
+
+
+def create_polish_snapshot(
+    *,
+    label: str,
+    round_num: int,
+    current_paragraphs: list[str],
+    polished_paragraphs: list[str],
+    reasons: list[str],
+    accepted: list[bool],
+    rejected: list[bool],
+    chat_history: list[dict],
+) -> dict:
+    """创建润色历史快照（深拷贝段落与对话状态）。"""
+    return {
+        "label": label,
+        "round": round_num,
+        "current_paragraphs": list(current_paragraphs),
+        "polished_paragraphs": list(polished_paragraphs),
+        "reasons": list(reasons),
+        "accepted": list(accepted),
+        "rejected": list(rejected),
+        "chat_history": [dict(msg) for msg in chat_history],
+    }
+
+
+def apply_polish_snapshot(snapshot: dict) -> dict:
+    """从快照提取可写回 session state 的字段。"""
+    return {
+        "current_paragraphs": list(snapshot["current_paragraphs"]),
+        "polished_paragraphs": list(snapshot["polished_paragraphs"]),
+        "reasons": list(snapshot["reasons"]),
+        "accepted": list(snapshot["accepted"]),
+        "rejected": list(snapshot["rejected"]),
+        "chat_history": [dict(msg) for msg in snapshot["chat_history"]],
+        "polish_round": snapshot["round"],
+    }
